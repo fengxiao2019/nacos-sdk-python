@@ -258,7 +258,6 @@ class NacosClient:
         self.subscribed_local_manager = SubscribedLocalManager()
         self.subscribe_timer_manager = NacosTimerManager()
         self.pulling_lock = RLock()
-        self.puller_mapping = None
         self.notify_queue = None
         self.callback_tread_pool = None
         self.process_mgr = None
@@ -273,6 +272,7 @@ class NacosClient:
         self.snapshot_base = DEFAULTS["SNAPSHOT_BASE"]
         self.no_snapshot = False
         self.proxies = None
+        self.watch_process = None
 
         logger.info("[client-init] endpoint:%s, tenant:%s" % (endpoint, namespace))
 
@@ -367,6 +367,9 @@ class NacosClient:
         except Exception as e:
             logger.exception("[publish] exception %s occur" % str(e))
             raise
+
+    def group_key(self, data_id, group):
+        return group_key(data_id, group, self.namespace)
 
     def get_config(self, data_id, group, timeout=None, no_snapshot=None):
         no_snapshot = self.no_snapshot if no_snapshot is None else no_snapshot
@@ -516,13 +519,13 @@ class NacosClient:
             return json.loads(content)
 
     @synchronized_with_attr("pulling_lock")
-    def add_config_watcher(self, data_id, group, cb, content=None):
-        self.add_config_watchers(data_id, group, [cb], content)
-
-    @synchronized_with_attr("pulling_lock")
     def add_config_watchers(self, data_id, group, cb_list, content=None):
         if not cb_list:
             raise NacosException("A callback function is needed.")
+
+        if not isinstance(cb_list, list):
+            cb_list = [cb_list]
+
         data_id, group = process_common_config_params(data_id, group)
         logger.info("[add-watcher] data_id:%s, group:%s, namespace:%s" % (data_id, group, self.namespace))
         cache_key = group_key(data_id, group, self.namespace)
@@ -538,40 +541,48 @@ class NacosClient:
             logger.info("[add-watcher] watcher has been added for key:%s, new callback is:%s, callback number is:%s" % (
                 cache_key, cb.__name__, len(wl)))
 
-        if self.puller_mapping is None:
+        if self.watch_process is None:
             logger.debug("[add-watcher] pulling should be initialized")
             self._init_pulling()
-
-        if cache_key in self.puller_mapping:
-            logger.debug("[add-watcher] key:%s is already in pulling" % cache_key)
-            return
-
-        for key, puller_info in self.puller_mapping.items():
-            if len(puller_info[1]) < self.pulling_config_size:
-                logger.debug("[add-watcher] puller:%s is available, add key:%s" % (puller_info[0], cache_key))
-                puller_info[1].append(cache_key)
-                self.puller_mapping[cache_key] = puller_info
-                break
-        else:
             logger.debug("[add-watcher] no puller available, new one and add key:%s" % cache_key)
-            key_list = self.process_mgr.list()
-            key_list.append(cache_key)
+            self.watch_keys.append(cache_key)
+            self.watch_dict[cache_key] = content
+
             sys_os = platform.system()
             if sys_os == 'Windows':
                 puller = Thread(target=self._do_pulling, args=(key_list, self.notify_queue))
                 puller.setDaemon(True)
             else:
-                puller = Process(target=self._do_pulling, args=(key_list, self.notify_queue))
+                puller = Process(target=self._do_pulling, args=(self.watch_keys, self.watch_dict, self.notify_queue))
                 puller.daemon = True
             puller.start()
-            self.puller_mapping[cache_key] = (puller, key_list)
+
+    def add_watch_key(self, data_id, group, cb_list):
+        if not cb_list:
+            raise NacosException("A callback function is needed.")
+        data_id, group = process_common_config_params(data_id, group)
+        logger.info("[add-watcher-key] data_id:%s, group:%s, namespace:%s" % (data_id, group, self.namespace))
+        cache_key = group_key(data_id, group, self.namespace)
+        if cache_key in self.watcher_mapping:
+            logger.info(f"[add-watcher-key] watch key {data_id}-{group_id} already exist.")
+            return
+        wl = []
+        self.watcher_mapping[cache_key] = wl
+        content = self.get_config(data_id, group)
+        last_md5 = NacosClient.get_md5(content)
+        self.watch_dict[cache_key] = content
+        for cb in cb_list:
+            wl.append(WatcherWrap(cache_key, cb, last_md5))
+            logger.info("[add-watcher] watcher has been added for key:%s, new callback is:%s, callback number is:%s" % (
+                cache_key, cb.__name__, len(wl)))
+        self.watch_keys.append(cache_key)
 
     @synchronized_with_attr("pulling_lock")
     def remove_config_watcher(self, data_id, group, cb, remove_all=False):
         if not cb:
             raise NacosException("A callback function is needed.")
         data_id, group = process_common_config_params(data_id, group)
-        if not self.puller_mapping:
+        if not self.watch_process:
             logger.warning("[remove-watcher] watcher is never started.")
             return
         cache_key = group_key(data_id, group, self.namespace)
@@ -594,13 +605,10 @@ class NacosClient:
         if not wl:
             logger.debug("[remove-watcher] there is no watcher for:%s, kick out from pulling" % cache_key)
             self.watcher_mapping.pop(cache_key)
-            puller_info = self.puller_mapping[cache_key]
-            puller_info[1].remove(cache_key)
-            if not puller_info[1]:
+            if not self.watcher_mapping:
                 logger.debug("[remove-watcher] there is no pulling keys for puller:%s, stop it" % puller_info[0])
-                self.puller_mapping.pop(cache_key)
-                if isinstance(puller_info[0], Process):
-                    puller_info[0].terminate()
+                if self.watch_process:
+                    self.watch_process.terminate()
 
     def _do_sync_req(self, url, headers=None, params=None, data=None, timeout=None, method="GET"):
         if self.username and self.password:
@@ -669,72 +677,69 @@ class NacosClient:
             self.change_server()
             logger.warning("[do-sync-req] %s maybe down, skip to next" % server)
 
-    def _do_pulling(self, cache_list, queue):
+    def _do_pulling(self, cache_list, dict_data, queue):
         cache_pool = dict()
         for cache_key in cache_list:
-            cache_pool[cache_key] = CacheData(cache_key, self)
+            cache_pool[cache_key] = nacos.client.CacheData(cache_key, self)
 
         while cache_list:
             unused_keys = set(cache_pool.keys())
-            contains_init_key = False
             probe_update_string = ""
             for cache_key in cache_list:
                 cache_data = cache_pool.get(cache_key)
                 if not cache_data:
-                    logger.debug("[do-pulling] new key added: %s" % cache_key)
-                    cache_data = CacheData(cache_key, self)
+                    nacos_client.logger.debug("[do-pulling] new key added: %s" % cache_key)
+                    cache_data = nacos_client.CacheData(cache_key, self)
                     cache_pool[cache_key] = cache_data
                 else:
                     unused_keys.remove(cache_key)
-                if cache_data.is_init:
-                    contains_init_key = True
-                data_id, group, namespace = parse_key(cache_key)
-                probe_update_string += WORD_SEPARATOR.join(
-                    [data_id, group, cache_data.md5 or "", self.namespace]) + LINE_SEPARATOR
+                data_id, group, namespace = nacos_params.parse_key(cache_key)
+                probe_update_string += nacos_client.WORD_SEPARATOR.join(
+                    [data_id, group, cache_data.md5 or "", self.namespace]) + \
+                                       nacos_client.LINE_SEPARATOR
 
             for k in unused_keys:
-                logger.debug("[do-pulling] %s is no longer watched, remove from cache" % k)
+                nacos_client.logger.debug("[do-pulling] %s is no longer watched, remove from cache" % k)
                 cache_pool.pop(k)
 
-            logger.debug(
+            nacos_client.logger.debug(
                 "[do-pulling] try to detected change from server probe string is %s" % truncate(probe_update_string))
             headers = {"Long-Pulling-Timeout": int(self.pulling_timeout * 1000)}
-            # if contains_init_key:
-            #     headers["longPullingNoHangUp"] = "true"
-
             data = {"Listening-Configs": probe_update_string}
 
             changed_keys = list()
             try:
                 resp = self._do_sync_req("/nacos/v1/cs/configs/listener", headers, None, data,
-                                         self.pulling_timeout + 10, "POST")
-                changed_keys = [group_key(*i) for i in parse_pulling_result(resp.read())]
-                logger.debug("[do-pulling] following keys are changed from server %s" % truncate(str(changed_keys)))
+                                         (self.pulling_timeout + 10), "POST")
+                changed_keys = [nacos_params.group_key(*i) for i in nacos_client.parse_pulling_result(resp.read())]
+                nacos_client.logger.debug("[do-pulling] following keys are changed from server %s" % truncate(str(changed_keys)))
             except NacosException as e:
-                logger.error("[do-pulling] nacos exception: %s, waiting for recovery" % str(e))
+                nacos_client.logger.error("[do-pulling] nacos exception: %s, waiting for recovery" % str(e))
                 time.sleep(1)
             except Exception as e:
-                logger.exception("[do-pulling] exception %s occur, return empty list, waiting for recovery" % str(e))
+                nacos_client.logger.exception("[do-pulling] exception %s occur, return empty list, waiting for recovery" % str(e))
                 time.sleep(1)
 
             for cache_key, cache_data in cache_pool.items():
                 cache_data.is_init = False
                 if cache_key in changed_keys:
-                    data_id, group, namespace = parse_key(cache_key)
+                    data_id, group, namespace = nacos_params.parse_key(cache_key)
                     content = self.get_config(data_id, group)
                     cache_data.md5 = NacosClient.get_md5(content)
                     cache_data.content = content
-                queue.put((cache_key, cache_data.content, cache_data.md5))
+                    dict_data[cache_key] = cache_data.content
+                    queue.put((cache_key, cache_data.content, cache_data.md5))
 
     @synchronized_with_attr("pulling_lock")
     def _init_pulling(self):
-        if self.puller_mapping is not None:
+        if self.watch_process is not None:
             logger.info("[init-pulling] puller is already initialized")
             return
-        self.puller_mapping = dict()
         self.notify_queue = Queue()
         self.callback_tread_pool = pool.ThreadPool(self.callback_thread_num)
         self.process_mgr = Manager()
+        self.watch_keys = self.process_mgr.list()
+        self.watch_dict = self.process_mgr.dict()
         t = Thread(target=self._process_polling_result)
         t.setDaemon(True)
         t.start()
@@ -770,6 +775,7 @@ class NacosClient:
                         logger.exception("[process-polling-result] exception %s occur while calling %s " % (
                             str(e), watcher.callback.__name__))
                     watcher.last_md5 = md5
+            time.sleep(1)
 
     def _get_common_headers(self, params, data):
         headers = {}
